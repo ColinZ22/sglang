@@ -2265,6 +2265,9 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    packed_modules_mapping = {
+      "gate_up_proj": ["gate_proj", "up_proj"],
+    }
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -2276,6 +2279,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         set_fp4_experts(getattr(config, "expert_dtype", None) == "fp4")
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self._remap_quark_exclude_list(quant_config)
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -2308,6 +2312,35 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.nsa_enable_prefill_cp:
             self.cp_rank = get_attention_tp_rank()
             self.cp_size = get_attention_tp_size()
+
+    @staticmethod
+    def _remap_quark_name(name):
+        if name.startswith("layers.") or name.startswith("mtp."):
+            name = "model." + name
+        elif name.startswith("*."):
+            name = "model.*." + name[2:]
+        name = name.replace(".attn.", ".self_attn.")
+        name = name.replace(".ffn.", ".mlp.")
+        return name
+
+    @staticmethod
+    def _remap_quark_exclude_list(quant_config):
+        if quant_config is None or not hasattr(quant_config, "quant_config"):
+            return
+        qc = quant_config.quant_config
+        if not isinstance(qc, dict) or "exclude" not in qc:
+            return
+        remapped = [
+            DeepseekV4ForCausalLM._remap_quark_name(n) for n in qc["exclude"]
+        ]
+        qc["exclude"] = remapped
+        if hasattr(quant_config, "exclude_layers"):
+            quant_config.exclude_layers = remapped
+        if hasattr(quant_config, "fp8_fallback_layers"):
+            quant_config.fp8_fallback_layers = [
+                DeepseekV4ForCausalLM._remap_quark_name(n)
+                for n in quant_config.fp8_fallback_layers
+            ]
 
     @property
     def routed_experts_weights_of_layer(self):

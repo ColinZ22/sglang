@@ -306,7 +306,7 @@ class ModelRunnerKVCacheMixin:
                 ), "In ring buffer swa mode, page_size must be 128."
 
             self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
-                max_num_reqs=self.server_args.max_running_requests,
+                max_num_reqs=self.max_running_requests,
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
                 c128_size=self.c128_max_total_num_tokens,

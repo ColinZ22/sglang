@@ -44,6 +44,8 @@ class QuarkConfig(QuantizationConfig):
         kv_cache_group: Optional[list[str]] = None,
         kv_cache_config: Optional[dict[str, Any]] = None,
         pack_method: str = "reorder",
+        fp8_fallback_config: Optional[Any] = None,
+        fp8_fallback_layers: Optional[list[str]] = None,
     ):
         super().__init__()
         if kv_cache_group is None:
@@ -53,6 +55,8 @@ class QuarkConfig(QuantizationConfig):
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
         self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
+        self.fp8_fallback_config = fp8_fallback_config
+        self.fp8_fallback_layers = fp8_fallback_layers or []
 
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
 
@@ -73,6 +77,11 @@ class QuarkConfig(QuantizationConfig):
     def apply_weight_name_mapper(self, hf_to_sglang_mapper):
         self.exclude_layers = hf_to_sglang_mapper.apply_list(self.exclude_layers)
 
+    def _is_fp8_fallback_layer(self, layer_name: str) -> bool:
+        return any(
+            fnmatch.fnmatch(layer_name, p) for p in self.fp8_fallback_layers
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
@@ -83,6 +92,13 @@ class QuarkConfig(QuantizationConfig):
             fused_mapping=self.packed_modules_mapping,
         ):
             if isinstance(layer, LinearBase):
+                if (
+                    self.fp8_fallback_config is not None
+                    and self._is_fp8_fallback_layer(prefix)
+                ):
+                    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+                    return Fp8LinearMethod(self.fp8_fallback_config)
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
@@ -164,11 +180,26 @@ class QuarkConfig(QuantizationConfig):
             if q_proj_q_config is not None:
                 q_proj_q_config["output_tensors"] = None
 
+        passthrough_quant = config.get("passthrough_quant_config")
+        fp8_fallback_config = None
+        fp8_fallback_layers: list[str] = []
+        if passthrough_quant is not None and passthrough_quant.get("quant_method") == "fp8":
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            fp8_fallback_config = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme=passthrough_quant.get("activation_scheme", "dynamic"),
+                weight_block_size=passthrough_quant.get("weight_block_size"),
+            )
+            fp8_fallback_layers = passthrough_quant.get("layers", [])
+
         return cls(
             quant_config=config,
             kv_cache_group=kv_cache_group,
             kv_cache_config=kv_cache_config,
             pack_method=pack_method,
+            fp8_fallback_config=fp8_fallback_config,
+            fp8_fallback_layers=fp8_fallback_layers,
         )
 
     @classmethod
