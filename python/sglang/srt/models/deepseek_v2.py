@@ -482,14 +482,20 @@ class DeepseekV2MoE(nn.Module):
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             )
         else:
+            # DSV4's reference inference does flat top-k over all routed experts
+            # (no group structure); fall back to use_grouped_topk=False when the
+            # config doesn't define ``n_group``/``topk_group``.
+            _n_group = getattr(config, "n_group", None)
+            _topk_group = getattr(config, "topk_group", None)
+            _use_grouped = _n_group is not None and _topk_group is not None
             self.topk = TopK(
                 top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
                 layer_id=self.layer_id,
                 renormalize=config.norm_topk_prob,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
+                use_grouped_topk=_use_grouped,
+                num_expert_group=_n_group,
                 num_fused_shared_experts=self.num_fused_shared_experts,
-                topk_group=config.topk_group,
+                topk_group=_topk_group,
                 correction_bias=self.gate.e_score_correction_bias,
                 quant_config=quant_config,
                 routed_scaling_factor=self.routed_scaling_factor,

@@ -72,6 +72,7 @@ from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_lo
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
@@ -2266,8 +2267,26 @@ class DeepseekV4Model(nn.Module):
 
 class DeepseekV4ForCausalLM(nn.Module):
     packed_modules_mapping = {
-      "gate_up_proj": ["gate_proj", "up_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "layers.": "model.layers.",
+            "mtp.": "model.mtp.",
+            "*.": "model.*.",
+        },
+        orig_to_new_substr={
+            ".attn.": ".self_attn.",
+            ".ffn.": ".mlp.",
+        },
+        orig_to_new_suffix={
+            ".w1": ".gate_proj",
+            ".w2": ".down_proj",
+            ".w3": ".up_proj",
+        },
+    )
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -2279,7 +2298,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         set_fp4_experts(getattr(config, "expert_dtype", None) == "fp4")
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self._remap_quark_exclude_list(quant_config)
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -2312,35 +2330,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.nsa_enable_prefill_cp:
             self.cp_rank = get_attention_tp_rank()
             self.cp_size = get_attention_tp_size()
-
-    @staticmethod
-    def _remap_quark_name(name):
-        if name.startswith("layers.") or name.startswith("mtp."):
-            name = "model." + name
-        elif name.startswith("*."):
-            name = "model.*." + name[2:]
-        name = name.replace(".attn.", ".self_attn.")
-        name = name.replace(".ffn.", ".mlp.")
-        return name
-
-    @staticmethod
-    def _remap_quark_exclude_list(quant_config):
-        if quant_config is None or not hasattr(quant_config, "quant_config"):
-            return
-        qc = quant_config.quant_config
-        if not isinstance(qc, dict) or "exclude" not in qc:
-            return
-        remapped = [
-            DeepseekV4ForCausalLM._remap_quark_name(n) for n in qc["exclude"]
-        ]
-        qc["exclude"] = remapped
-        if hasattr(quant_config, "exclude_layers"):
-            quant_config.exclude_layers = remapped
-        if hasattr(quant_config, "fp8_fallback_layers"):
-            quant_config.fp8_fallback_layers = [
-                DeepseekV4ForCausalLM._remap_quark_name(n)
-                for n in quant_config.fp8_fallback_layers
-            ]
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -2523,6 +2512,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             if "self_attn" in name and (
                 "compressor" not in name or not COMPRESSOR_BIT_WISE_EQUAL_MODE
             ):
+                # Quark ckpt convention
+                name = name.replace(".weight_scale", ".weight_scale_inv")
                 name = name.replace(".scale", ".weight_scale_inv")
 
         if not MOE_BIT_WISE_EQUAL_MODE:
@@ -2942,28 +2933,36 @@ def _dequant_fp8_wo_a(
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     """Dequant fp8 wo_a weights inline: pair (wo_a.scale, wo_a.weight) -> bf16 wo_a.weight.
 
-    Streaming version: buffers only wo_a.scale tensors (tiny) until the
-    corresponding wo_a.weight arrives.  All other weights pass through
-    immediately so we never materialise the full checkpoint in memory.
+    Buffers either side until its partner arrives. Original DSV4 ckpts emit
+    ``.wo_a.scale`` before ``.wo_a.weight`` (alphabetical); Quark ckpts emit
+    ``.wo_a.weight`` before ``.wo_a.weight_scale``. Normalize Quark's suffix
+    to ``.wo_a.scale`` on entry, then handle either arrival order.
     """
     pending_scales: dict[str, torch.Tensor] = {}
+    pending_weights: dict[str, torch.Tensor] = {}
 
     for name, tensor in weights:
+        if name.endswith(".wo_a.weight_scale"):
+            name = name[: -len(".wo_a.weight_scale")] + ".wo_a.scale"
+
         if name.endswith(".wo_a.scale"):
-            pending_scales[name] = tensor
+            prefix = name[: -len(".wo_a.scale")]
+            if prefix in pending_weights:
+                w = pending_weights.pop(prefix)
+                yield f"{prefix}.wo_a.weight", _dequant_fp8(w, tensor)
+            else:
+                pending_scales[prefix] = tensor
             continue
 
         if name.endswith(".wo_a.weight") and tensor.dtype == torch.float8_e4m3fn:
-            scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
-            assert scale_name in pending_scales, (
-                f"wo_a.scale must appear before wo_a.weight in checkpoint, "
-                f"missing {scale_name}"
-            )
-            scale = pending_scales.pop(scale_name)
-            yield name, _dequant_fp8(tensor, scale)
+            prefix = name[: -len(".wo_a.weight")]
+            if prefix in pending_scales:
+                yield name, _dequant_fp8(tensor, pending_scales.pop(prefix))
+            else:
+                pending_weights[prefix] = tensor
             continue
 
         yield name, tensor
 
-    for scale_name, scale_tensor in pending_scales.items():
-        yield scale_name, scale_tensor
+    for prefix, scale_tensor in pending_scales.items():
+        yield f"{prefix}.wo_a.scale", scale_tensor

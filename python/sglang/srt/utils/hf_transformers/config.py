@@ -116,6 +116,41 @@ def get_config(
                     config._name_or_path = model
                 else:
                     raise
+    # Bridge schema drift between SGLang's DSV4 reader sites and the upstream
+    # transformers DeepseekV4Config: the latter drops raw-JSON keys SGLang
+    # reads (``compress_ratios``, ``num_hash_layers``), reshapes flat
+    # ``rope_scaling`` into a nested ``{main, compress}`` form, and lacks the
+    # DSV3-shape fields the model still references (``first_k_dense_replace``,
+    # ``moe_layer_freq``, ``n_group``, ``topk_group``).
+    if (
+        config.architectures is not None
+        and config.architectures[0] == "DeepseekV4ForCausalLM"
+    ):
+        import json
+        import os
+
+        cfg_json = (
+            os.path.join(model, "config.json") if isinstance(model, str) else None
+        )
+        if cfg_json and os.path.exists(cfg_json):
+            with open(cfg_json, "r") as f:
+                raw = json.load(f)
+            for k, v in raw.items():
+                if not hasattr(config, k):
+                    setattr(config, k, v)
+            if isinstance(raw.get("rope_scaling"), dict) and set(
+                getattr(config, "rope_scaling", {}) or {}
+            ) == {"main", "compress"}:
+                config.rope_scaling = raw["rope_scaling"]
+        for k, v in (
+            ("first_k_dense_replace", 0),
+            ("moe_layer_freq", 1),
+            ("n_group", None),
+            ("topk_group", None),
+        ):
+            if not hasattr(config, k):
+                setattr(config, k, v)
+
     if (
         config.architectures is not None
         and config.architectures[0] == "Phi4MMForCausalLM"

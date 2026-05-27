@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkW4A4MXFP4,
     QuarkW4A4MXFp4MoE,
     QuarkW8A8Fp8,
+    QuarkW8A8Fp8Block,
     QuarkW8A8FP8MoE,
 )
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
@@ -44,8 +45,6 @@ class QuarkConfig(QuantizationConfig):
         kv_cache_group: Optional[list[str]] = None,
         kv_cache_config: Optional[dict[str, Any]] = None,
         pack_method: str = "reorder",
-        fp8_fallback_config: Optional[Any] = None,
-        fp8_fallback_layers: Optional[list[str]] = None,
     ):
         super().__init__()
         if kv_cache_group is None:
@@ -55,8 +54,6 @@ class QuarkConfig(QuantizationConfig):
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
         self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
-        self.fp8_fallback_config = fp8_fallback_config
-        self.fp8_fallback_layers = fp8_fallback_layers or []
 
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
 
@@ -76,11 +73,13 @@ class QuarkConfig(QuantizationConfig):
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper):
         self.exclude_layers = hf_to_sglang_mapper.apply_list(self.exclude_layers)
-
-    def _is_fp8_fallback_layer(self, layer_name: str) -> bool:
-        return any(
-            fnmatch.fnmatch(layer_name, p) for p in self.fp8_fallback_layers
-        )
+        qc = self.quant_config
+        if isinstance(qc, dict):
+            if "exclude" in qc:
+                qc["exclude"] = hf_to_sglang_mapper.apply_list(qc["exclude"])
+            lqc = qc.get("layer_quant_config")
+            if isinstance(lqc, dict):
+                qc["layer_quant_config"] = hf_to_sglang_mapper.apply_dict(lqc)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -92,13 +91,6 @@ class QuarkConfig(QuantizationConfig):
             fused_mapping=self.packed_modules_mapping,
         ):
             if isinstance(layer, LinearBase):
-                if (
-                    self.fp8_fallback_config is not None
-                    and self._is_fp8_fallback_layer(prefix)
-                ):
-                    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-
-                    return Fp8LinearMethod(self.fp8_fallback_config)
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
@@ -180,26 +172,11 @@ class QuarkConfig(QuantizationConfig):
             if q_proj_q_config is not None:
                 q_proj_q_config["output_tensors"] = None
 
-        passthrough_quant = config.get("passthrough_quant_config")
-        fp8_fallback_config = None
-        fp8_fallback_layers: list[str] = []
-        if passthrough_quant is not None and passthrough_quant.get("quant_method") == "fp8":
-            from sglang.srt.layers.quantization.fp8 import Fp8Config
-
-            fp8_fallback_config = Fp8Config(
-                is_checkpoint_fp8_serialized=True,
-                activation_scheme=passthrough_quant.get("activation_scheme", "dynamic"),
-                weight_block_size=passthrough_quant.get("weight_block_size"),
-            )
-            fp8_fallback_layers = passthrough_quant.get("layers", [])
-
         return cls(
             quant_config=config,
             kv_cache_group=kv_cache_group,
             kv_cache_config=kv_cache_config,
             pack_method=pack_method,
-            fp8_fallback_config=fp8_fallback_config,
-            fp8_fallback_layers=fp8_fallback_layers,
         )
 
     @classmethod
@@ -254,6 +231,37 @@ class QuarkConfig(QuantizationConfig):
         # Confirm activation scheme is supported.
         is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
         return is_per_tensor_activation
+
+    def _is_fp8_w8a8_block(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        """Detect Quark's representation of native DeepSeek-V3/V4 blockwise FP8.
+
+        Weights are stored as ``fp8_e4m3`` quantized in 2-D blocks (typically
+        ``[128, 128]``) with one scale per block; activations are quantized
+        dynamically in ``fp8_e4m3`` groups along the last axis (group_size=128).
+        """
+        if weight_quant is None or input_quant is None:
+            return False
+        if (
+            weight_quant.get("dtype") != "fp8_e4m3"
+            or input_quant.get("dtype") != "fp8_e4m3"
+        ):
+            return False
+        if weight_quant.get("qscheme") != "per_block":
+            return False
+        block_size = weight_quant.get("block_size")
+        if not block_size or len(block_size) != 2:
+            return False
+        if weight_quant.get("is_dynamic") is True:
+            return False
+        if input_quant.get("qscheme") != "per_group":
+            return False
+        if not input_quant.get("is_dynamic"):
+            return False
+        return True
 
     def _is_mx_fp4(
         self,
@@ -363,6 +371,9 @@ class QuarkConfig(QuantizationConfig):
 
         if self._is_mx_fp4(weight_config, input_config):
             return QuarkW4A4MXFP4(weight_config, input_config)
+        if self._is_fp8_w8a8_block(weight_config, input_config):
+            self._check_scheme_supported(QuarkW8A8Fp8Block.get_min_capability())
+            return QuarkW8A8Fp8Block(weight_config, input_config)
         if self._is_fp8_w8a8(weight_config, input_config):
             is_fp8_w8a8_supported = self._check_scheme_supported(
                 QuarkW8A8Fp8.get_min_capability(), error=False
@@ -409,6 +420,12 @@ class QuarkConfig(QuantizationConfig):
 
         if self._is_mx_fp4(weight_config, input_config):
             return QuarkW4A4MXFp4MoE(weight_config, input_config)
+        elif self._is_fp8_w8a8_block(weight_config, input_config):
+            raise NotImplementedError(
+                "Quark blockwise FP8 MoE is not yet implemented; only blockwise FP8 "
+                "Linear is supported. Re-quantize experts to MXFP4 or per-tensor/"
+                "per-channel FP8."
+            )
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
         else:
