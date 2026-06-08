@@ -2,7 +2,7 @@
 
 import fnmatch
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import torch
 
@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.base_config import (  # noqa: E501
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.schemes import (
     QuarkLinearScheme,
@@ -23,15 +24,75 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
-from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
+from sglang.srt.layers.quantization.quark.utils import (
+    Nvfp4SourceConfig,
+    deep_compare,
+    should_ignore_layer,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_device_capability
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 __all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
+
+
+def _parse_nvfp4_excludes(hf_quant_config: Dict[str, Any]) -> List[str]:
+    """Extract NVFP4 producer-declared excludes as `re:` patterns.
+
+    Reads the producer-specific key:
+      - `ignore`           — compressed-tensors / ModelOpt (config.json)
+      - `exclude_modules`  — ModelOpt hf_quant_config.json
+      - `exclude`          — AMD Quark export
+
+    All three are fnmatch-style (literal strings work too — `fnmatch.translate`
+    produces an anchored regex match). Returns [] if no key present.
+    """
+    pats = (
+        hf_quant_config.get("ignore")
+        or hf_quant_config.get("exclude_modules")
+        or hf_quant_config.get("exclude")
+        or []
+    )
+    return ["re:" + fnmatch.translate(p) for p in pats]
+
+
+def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"]:
+    """Return an Nvfp4SourceConfig if `config` (the checkpoint's
+    quantization_config dict) describes an NVFP4 source, else None.
+
+    Handles three producers:
+      - ModelOpt:           quant_method in {modelopt, modelopt_fp4, nvfp4}
+                            with quant_algo NVFP4/FP4 (or unspecified)
+      - AMD Quark:          quant_method == "quark" and
+                            global_quant_config.weight.dtype == "fp4"
+      - compressed-tensors: quant_method == "compressed-tensors" / "compressed_tensors"
+                            (global scale folded into weight_scale — no scale_2)
+    """
+    from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
+
+    qm = config.get("quant_method", "")
+    qa = (config.get("quant_algo") or "").upper()
+
+    if qm in ("modelopt", "modelopt_fp4", "nvfp4") and qa in ("", "NVFP4", "FP4"):
+        return Nvfp4SourceConfig(has_per_tensor_scale=True)
+    if qm == "quark":
+        # `weight` can be a dict (older Quark) or a list of specs (newer
+        # exporter — first entry describes the weight tensor).
+        gw = config.get("global_quant_config", {}).get("weight")
+        if isinstance(gw, list) and gw:
+            gw = gw[0]
+        if isinstance(gw, dict) and gw.get("dtype") == "fp4":
+            return Nvfp4SourceConfig(has_per_tensor_scale=True)
+        return None
+    if qm in ("compressed-tensors", "compressed_tensors"):
+        return Nvfp4SourceConfig(has_per_tensor_scale=False)
+    return None
+
 
 logger = logging.getLogger(__name__)
 
@@ -40,21 +101,53 @@ class QuarkConfig(QuantizationConfig):
 
     def __init__(
         self,
-        quant_config: dict[str, Any],
+        quant_config: dict[str, Any] | None = None,
+        hf_config: "PretrainedConfig | None" = None,
         kv_cache_group: Optional[list[str]] = None,
         kv_cache_config: Optional[dict[str, Any]] = None,
         pack_method: str = "reorder",
+        is_prequantized: bool = False,
+        online_scheme: Optional[str] = None,
+        dequantization_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         if kv_cache_group is None:
             kv_cache_group = []
+
+        if online_scheme is not None:
+            assert not is_prequantized
+            if online_scheme == "quark_mxfp4":
+                quant_config = self._create_online_mxfp4_config(
+                    model_type=hf_config.model_type
+                )
+            else:
+                raise ValueError(f"Unsupported online_scheme: {online_scheme}")
+
+        if quant_config is None:
+            raise ValueError("Either quant_config or online_scheme must be provided")
+
         self.quant_config = quant_config
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
         self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
-
+        self.is_prequantized = is_prequantized
+        self.dequantization_config = dequantization_config
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
+        self._quantized_layers = set()
+
+        if isinstance(self.dequantization_config, Fp8Config):
+            self.weight_block_size = self.dequantization_config.weight_block_size
+
+    @property
+    def quantized_layers(self) -> tuple[dict[str, int], int]:
+        # Count layers per type (last two parts after ".")
+        type_counts: dict[str, int] = {}
+        for name in self._quantized_layers:
+            parts = name.split(".")
+            layer_type = ".".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+            type_counts[layer_type] = type_counts.get(layer_type, 0) + 1
+        return dict(sorted(type_counts.items())), len(self._quantized_layers)
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
@@ -77,12 +170,18 @@ class QuarkConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         # Check if the layer is skipped for quantization.
+
         if should_ignore_layer(
             prefix,
             ignore=self.exclude_layers,
             fused_mapping=self.packed_modules_mapping,
         ):
             if isinstance(layer, LinearBase):
+                if isinstance(self.dequantization_config, Fp8Config):
+                    # FP8 source: excluded layers remain FP8 in checkpoint.
+                    return Fp8LinearMethod(quant_config=self.dequantization_config)
+                # NVFP4 source ModelOpt exports keep excluded layers in bf16; no
+                # dequantization_config (BF16 source online MXFP4): also bf16.
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
@@ -91,14 +190,17 @@ class QuarkConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
+            self._quantized_layers.add(prefix)
             return QuarkLinearMethod(self)
 
         if isinstance(layer, RadixAttention):
+            self._quantized_layers.add(prefix)
             return QuarkKVCacheMethod(self)
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if isinstance(layer, FusedMoE):
+            self._quantized_layers.add(prefix)
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return QuarkFusedMoEMethod(self)
 
@@ -106,6 +208,63 @@ class QuarkConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "QuarkConfig":
+        # Requantization dispatch is gated on requantization_method, NOT on
+        # quant_method. Quark-exported NVFP4 carries quant_method="quark" — the
+        # old `quant_method != "quark"` check would route it to the prequantized
+        # path and miss the requant intent entirely.
+        if config.get("requantization_method") == "quark_mxfp4":
+            hf_config = config["hf_config"]
+
+            # FP8 -> MXFP4 (PR #18182).
+            if (
+                config["quant_method"] == "fp8"
+                and config.get("activation_scheme") == "dynamic"
+            ):
+                quant_config = QuarkConfig._create_online_mxfp4_config(
+                    model_type=hf_config.model_type
+                )
+                dequantization_config = Fp8Config.from_config(config)
+                return cls(
+                    quant_config=quant_config,
+                    hf_config=hf_config,
+                    is_prequantized=False,
+                    dequantization_config=dequantization_config,
+                )
+
+            # NVFP4 -> MXFP4. Producer-declared excludes are required to load
+            # any NVFP4 checkpoint whose attention/early-layer Linears were
+            # kept at bf16 (e.g. MiniMax-M2-NVFP4, Kimi-K2-NVFP4) — without
+            # them we'd try to materialize NVFP4 params for those layers and
+            # crash on dtype mismatch with the bf16 source weights.
+            nvfp4_src = _detect_nvfp4_source(config)
+            if nvfp4_src is not None:
+                source_excludes = _parse_nvfp4_excludes(config)
+                quant_config = QuarkConfig._create_online_mxfp4_config(
+                    model_type=hf_config.model_type,
+                    source_excludes=source_excludes,
+                )
+                return cls(
+                    quant_config=quant_config,
+                    hf_config=hf_config,
+                    is_prequantized=False,
+                    dequantization_config=nvfp4_src,
+                )
+
+            raise NotImplementedError(
+                f"Requantization into {config['requantization_method']} is not supported, "
+                f"from the original quant_method={config['quant_method']} "
+                f"and activation_scheme={config.get('activation_scheme')}."
+            )
+
+        # Non-requant entry from a quant_method other than "quark" with no
+        # requantization_method set — preserve the original error for callers
+        # who used to hit this path.
+        if config["quant_method"] != "quark":
+            raise ValueError(
+                f"QuarkConfig.from_config invoked with non-quark quant_method "
+                f"{config['quant_method']!r} but no requantization_method set."
+            )
+
         export_config = config.get("export")
         if export_config is None:
             raise ValueError(
@@ -169,11 +328,93 @@ class QuarkConfig(QuantizationConfig):
             kv_cache_group=kv_cache_group,
             kv_cache_config=kv_cache_config,
             pack_method=pack_method,
+            is_prequantized=True,
         )
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
         return []
+
+    @staticmethod
+    def _create_online_mxfp4_config(
+        model_type: str,
+        source_excludes: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Create a synthetic quant_config for online MXFP4 quantization.
+
+        If ``source_excludes`` is provided (NVFP4 source: producer-declared
+        ignore list parsed by :func:`_parse_nvfp4_excludes`), it supersedes
+        the per-model heuristic — both are 4-bit regimes so the producer's
+        NVFP4 excludes transfer directly to MXFP4. For non-NVFP4 sources
+        (BF16 / FP8) the heuristic is the only signal we have for
+        accuracy-sensitive layers.
+        """
+        # MOE gate/router is typically implemented as a ReplicatedLinear, and skipped for quantization for accuracy reasons.
+        # lm_head/embed_tokens is also skipped for accuracy reasons, normally not handled by `QuarkConfig` in any case, but adding them here for safety.
+        exclude = [
+            "re:.*gate$",
+            "re:.*router",
+            "re:.*lm_head",
+            "re:.*embed_tokens",
+        ]
+
+        if source_excludes:
+            exclude.extend(source_excludes)
+        else:
+            # Exclusion for accuracy adapted from
+            # https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json
+            if model_type == "deepseek_v3":
+                exclude.extend(
+                    [
+                        "re:.*model.layers.61.*",
+                        "re:.*self_attn.*",
+                        "re:.*mlp.gate$",
+                    ]
+                )
+            elif model_type == "qwen3_5_moe":
+                # Exclusion for accuracy adapted from
+                # https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4/blob/main/config.json
+                exclude.extend(
+                    [
+                        "re:.*n_proj_a",
+                        "re:.*in_proj_b",
+                        "re:.*in_proj_qkv",
+                        "re:.*in_proj_z",
+                        "re:.*o_proj",
+                        "re:.*out_proj",
+                        "re:.*qkv_proj",
+                        "re:.*shared_expert",
+                    ]
+                )
+
+        return {
+            "packed_modules_mapping": {},
+            "exclude": exclude,
+            "global_quant_config": {
+                "weight": {
+                    "dtype": "fp4",
+                    "qscheme": "per_group",
+                    "group_size": 32,
+                    "is_dynamic": False,
+                    "scale_format": "e8m0",
+                },
+                "input_tensors": {
+                    "dtype": "fp4",
+                    "qscheme": "per_group",
+                    "group_size": 32,
+                    "is_dynamic": True,
+                    "scale_format": "e8m0",
+                },
+                "output_tensors": None,
+                "bias": None,
+            },
+            "layer_quant_config": {},
+            "layer_type_quant_config": {},
+            "export": {
+                "kv_cache_group": [],
+                "pack_method": "reorder",
+            },
+        }
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
         capability_tuple = get_device_capability()
@@ -331,7 +572,12 @@ class QuarkConfig(QuantizationConfig):
         input_config = cast(dict[str, Any], config.get("input_tensors"))
 
         if self._is_mx_fp4(weight_config, input_config):
-            return QuarkW4A4MXFP4(weight_config, input_config)
+            return QuarkW4A4MXFP4(
+                weight_config,
+                input_config,
+                is_checkpoint_mxfp4_serialized=self.is_prequantized,
+                dequantization_config=self.dequantization_config,
+            )
         if self._is_fp8_w8a8(weight_config, input_config):
             is_fp8_w8a8_supported = self._check_scheme_supported(
                 QuarkW8A8Fp8.get_min_capability(), error=False
@@ -377,7 +623,12 @@ class QuarkConfig(QuantizationConfig):
         input_config = layer_quant_config.get("input_tensors")
 
         if self._is_mx_fp4(weight_config, input_config):
-            return QuarkW4A4MXFp4MoE(weight_config, input_config)
+            return QuarkW4A4MXFp4MoE(
+                weight_config,
+                input_config,
+                is_checkpoint_mxfp4_serialized=self.is_prequantized,
+                dequantization_config=self.dequantization_config,
+            )
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
         else:
@@ -391,6 +642,7 @@ class QuarkLinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: QuarkConfig):
         self.quantization_config = quantization_config
+        self.quant_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
