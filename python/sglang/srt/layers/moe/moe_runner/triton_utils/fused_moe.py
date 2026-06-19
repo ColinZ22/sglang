@@ -240,12 +240,52 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    nvfp4_emulation: bool = False,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
+
+    if nvfp4_emulation:
+        # Bypass registered custom ops and call fused_experts_impl directly
+        # so nvfp4_emulation reaches _fused_moe_kernel_sequence
+        # a2_scale is consumed by the fake-quant inside _fused_moe_kernel_sequence
+        # and must NOT be forwarded to invoke_fused_moe_kernel (which asserts A_scale is None for BF16)
+        return fused_experts_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            b1,
+            b2,
+            moe_runner_config.inplace,
+            moe_runner_config.activation,
+            moe_runner_config.is_gated,
+            moe_runner_config.apply_router_weight_on_input,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            per_channel_quant,
+            w1_scale,
+            w2_scale,
+            w1_zp,
+            w2_zp,
+            a1_scale,
+            a2_scale,
+            block_shape,
+            moe_runner_config.no_combine,
+            moe_runner_config.routed_scaling_factor,
+            moe_runner_config.gemm1_alpha,
+            moe_runner_config.gemm1_clamp_limit,
+            filter_expert,
+            swiglu_limit=moe_runner_config.swiglu_limit,
+            nvfp4_emulation=True,
+        )
+
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         inplace_fused_experts(
@@ -441,6 +481,7 @@ def _fused_moe_kernel_sequence(
     filter_expert: bool,
     hooks: Optional[Any] = None,
     swiglu_limit: Optional[float] = None,
+    nvfp4_emulation: bool = False,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -653,6 +694,17 @@ def _fused_moe_kernel_sequence(
 
     del intermediate_cache1
 
+    if nvfp4_emulation:
+        # Fake-quantize the post-activation intermediate (w2 input) to match
+        # native NVFP4 hardware behavior. a2_scale is 1/w2_input_scale.
+        # Clear a2_scale after use since invoke_fused_moe_kernel asserts None
+        from sglang.srt.layers.quantization.dequantization import (
+            ref_nvfp4_quant_dequant,
+        )
+
+        intermediate_cache2 = ref_nvfp4_quant_dequant(intermediate_cache2, a2_scale)
+        a2_scale = None
+
     intermediate_cache3 = torch.empty(
         (num_tokens, topk, w2.shape[1]),
         device=hidden_states.device,
@@ -820,6 +872,7 @@ def fused_experts_impl(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
+    nvfp4_emulation: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -895,6 +948,7 @@ def fused_experts_impl(
         filter_expert=filter_expert,
         hooks=None,
         swiglu_limit=swiglu_limit,
+        nvfp4_emulation=nvfp4_emulation,
     )
 
 

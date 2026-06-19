@@ -329,8 +329,20 @@ class FusedMoE(torch.nn.Module):
                 )
             self.moe_runner_config.inplace = False
 
-        self.should_fuse_routed_scaling_factor_in_topk = (
+        from sglang.srt.layers.quantization.fp4_utils import (
+            get_fp4_gemm_runner_backend,
+        )
+
+        # The NVFP4 emulation backend dequantizes weights and runs the standard
+        # Triton fused-MoE runner, which applies routed_scaling_factor itself in
+        # the combine step. So it must NOT fuse routed scaling into topk
+        nvfp4_fuses_routed_scaling = (
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            and not get_fp4_gemm_runner_backend().is_emulation()
+        )
+
+        self.should_fuse_routed_scaling_factor_in_topk = (
+            nvfp4_fuses_routed_scaling
             or (
                 isinstance(self.quant_method, Fp8MoEMethod)
                 and (

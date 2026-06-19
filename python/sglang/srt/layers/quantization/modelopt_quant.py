@@ -1465,6 +1465,20 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer.weights_padding_cols = 0
             return
 
+        if get_fp4_gemm_runner_backend().is_emulation():
+            # Software emulation path: dequant weights + activations then torch.matmul.
+            # weight_scale is kept in linear (non-swizzled) layout (required by dequantize_nvfp4).
+            from sglang.srt.layers.quantization.dequantization import (
+                warmup_fp4_e2m1_lut,
+            )
+
+            # Cache LUT on-device once here to avoid host->device copies during
+            # CUDA graph capture.
+            warmup_fp4_e2m1_lut(layer.weight.device)
+            copy_or_rebind_param(layer, "weight_global_scale", weight_scale_2)
+            layer.weights_padding_cols = 0
+            return
+
         if not is_blackwell_supported():
             raise ValueError(
                 "ModelOpt NVFP4 native dense GEMM backends require SM100+. "
@@ -1628,6 +1642,33 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        if get_fp4_gemm_runner_backend().is_emulation():
+            from sglang.srt.layers.quantization.dequantization import (
+                run_nvfp4_emulations,
+            )
+
+            # x may arrive as a 3-tuple (tensor, None, output_buf) from
+            # deepseek_v2.py when a bump-allocator is active. That
+            # pre-alloc is a native-CUTLASS optimization; emulation allocates its
+            # own buffers, so just unwrap the activation tensor.
+            if isinstance(x, tuple):
+                x = x[0]
+            x_m, _ = x.shape
+            output_size = layer.output_size_per_partition
+            # layer.input_scale_inv is 1/input_scale (the inverse global scale expected by
+            # ref_nvfp4_quant). layer.weight_scale is un-swizzled (see process_weights_after_loading).
+            out = run_nvfp4_emulations(
+                x=x,
+                input_global_scale=layer.input_scale_inv,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                weight_global_scale=layer.weight_global_scale,
+                output_dtype=x.dtype,
+            )
+            if bias is not None:
+                out = out + bias
+            return out.view(x_m, output_size)
+
         # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
         # tuple from unrelated code can't silently bypass quantization.
         if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(x, tuple):
@@ -1720,11 +1761,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
             use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not is_blackwell_supported() and not use_marlin_fallback:
+        use_emulation = get_fp4_gemm_runner_backend().is_emulation()
+        if (
+            not is_blackwell_supported()
+            and not use_marlin_fallback
+            and not use_emulation
+        ):
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization with the selected MoE backend. Please use "
-                "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
+                "Blackwell and above, or use moe_runner_backend=marlin on SM80+, "
+                "or use --fp4-gemm-backend emulation for software fallback."
+            )
+        if use_emulation:
+            logger.warning_once(
+                "Using NVFP4 MoE emulation backend: weights are dequantized to BF16 "
+                "on every forward pass. This is slower than native hardware FP4 support."
             )
         self.enable_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
@@ -1977,6 +2029,64 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_weight_scale_2.contiguous(),
             )
             prepare_moe_nvfp4_layer_for_marlin(layer)
+            return
+
+        if get_fp4_gemm_runner_backend().is_emulation():
+            # Software emulation path: weights stay in linear (non-swizzled) layout.
+            # The Triton fused-MoE kernel receives dequantized BF16 weights in apply().
+            from sglang.srt.layers.quantization.dequantization import (
+                warmup_fp4_e2m1_lut,
+            )
+
+            # Cache LUT on-device once here to avoid host->device copies during
+            # CUDA graph capture.
+            warmup_fp4_e2m1_lut(layer.w13_weight.device)
+
+            # w13 fuses gate and up projections. Each has its own weight_scale_2 scalar
+            # in the checkpoint. Build a per-output-row global scale so
+            # dequantize_nvfp4 applies the correct scalar to each part independently
+            ws2 = layer.w13_weight_scale_2
+            n13_rows = layer.w13_weight.shape[1]  # 2 * intermediate_size_per_partition
+            half = n13_rows // 2
+            if ws2.dim() == 2 and ws2.shape[1] >= 2:
+                if not torch.allclose(ws2[:, 0], ws2[:, 1]):
+                    logger.warning_once(
+                        "NVFP4 emulation: w1_weight_scale_2 != w3_weight_scale_2 "
+                        "for some experts; applying per-row global scales for w13."
+                    )
+                w13_scale2_per_row = (
+                    ws2[:, :2].repeat_interleave(half, dim=1).reshape(-1).contiguous()
+                )
+            else:
+                # all n13 rows of every expert share one scale
+                w13_scale2_per_row = (
+                    ws2.reshape(-1).repeat_interleave(n13_rows).contiguous()
+                )
+            copy_or_rebind_param(
+                layer, "w13_weight_scale_2_per_row", w13_scale2_per_row
+            )
+
+            # Precompute inverse input scales for quant-dequant of both activations:
+            # w13 input (x before GEMM1) and w2 input (intermediate after activation).
+            # ref_nvfp4_quant_dequant takes 1/input_scale (inverse global scale).
+            w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
+            copy_or_rebind_param(
+                layer,
+                "w13_input_scale_quant",
+                (1 / w13_input_scale).to(torch.float32),
+            )
+            w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
+            copy_or_rebind_param(
+                layer,
+                "w2_input_scale_quant",
+                (1 / w2_input_scale).to(torch.float32),
+            )
+            # Free the eagerly-allocated swizzled blockscale Parameters from
+            # create_weights by aliasing them to the raw (linear-layout) scales,
+            # which is what dequantize_nvfp4 consumes.
+            layer.w13_blockscale_swizzled = layer.w13_weight_scale
+            layer.w2_blockscale_swizzled = layer.w2_weight_scale
+            layer.dispatcher.set_quant_config({"input_global_scale": None})
             return
 
         # Calculate input scales based on strategy
@@ -2251,7 +2361,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
-        if moe_runner_backend.is_auto():
+        if get_fp4_gemm_runner_backend().is_emulation():
+            # Emulation dequantizes weights to BF16 and calls the Triton fused-MoE kernel.
+            moe_runner_backend = MoeRunnerBackend.TRITON
+
+        elif moe_runner_backend.is_auto():
             if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
                 moe_runner_backend = MoeRunnerBackend.MARLIN
             else:
@@ -2262,7 +2376,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self._moe_runner_backend = moe_runner_backend
 
         if moe_runner_backend.is_flashinfer_cutedsl():
-            import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 - triggers @register_fused_func
 
         if not moe_runner_backend.is_flashinfer_cutlass():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
@@ -2314,6 +2428,78 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 global_num_experts=global_num_experts,
             )
             return self.runner.run(dispatch_output, quant_info)
+
+        if (
+            moe_runner_backend.is_triton()
+            and get_fp4_gemm_runner_backend().is_emulation()
+        ):
+            # Software emulation: dequantize w13/w2 to BF16, quant-dequant activations,
+            # then call the standard Triton fused-MoE kernel.
+            from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+            from sglang.srt.layers.moe.token_dispatcher.standard import (
+                StandardDispatchOutput,
+            )
+            from sglang.srt.layers.quantization.dequantization import (
+                dequantize_nvfp4,
+                get_dequant_weight_buffer,
+                ref_nvfp4_quant_dequant,
+            )
+
+            x = dispatch_output.hidden_states
+            # layer.w13_weight_scale is un-swizzled (linear layout).
+            # Gate scale (col 0) + optional up/gate ratio precomputed at load.
+            # Dequant into shared per-shape scratch buffers so memory stays
+            # bounded across all MoE layers (critical under CUDA graph capture).
+            E, n13, packed_k13 = layer.w13_weight.shape
+            E2, n2, packed_k2 = layer.w2_weight.shape
+            out_dtype = x.dtype
+            dq_w13_buf = get_dequant_weight_buffer(
+                (E, n13, packed_k13 * 2), out_dtype, layer.w13_weight.device
+            )
+            dq_w2_buf = get_dequant_weight_buffer(
+                (E2, n2, packed_k2 * 2), out_dtype, layer.w2_weight.device
+            )
+            # w13_weight_scale_2_per_row is [E*2]
+            # dequantize_nvfp4 checks numel==total_rows and applies one scalar per row.
+            dq_w13 = dequantize_nvfp4(
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                layer.w13_weight_scale_2_per_row,
+                out_dtype=out_dtype,
+                out=dq_w13_buf,
+            )
+            dq_w2 = dequantize_nvfp4(
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                layer.w2_weight_scale_2,
+                out_dtype=out_dtype,
+                out=dq_w2_buf,
+            )
+            # Quant-dequant the w13 input using the inverse input scale
+            # (1/w13_input_scale). ref_nvfp4_quant_dequant takes a single scalar
+            # global scale, so collapse per-expert scales. w13_input_scale_quant
+            # is 1/scale, so the smallest reciprocal (== largest input scale)
+            # bounds every expert's range; reduce with min to stay conservative.
+            #
+            # Fake-quantize the w13 input. The w2 input (post-activation
+            # intermediate) is fake-quantized inside _fused_moe_kernel_sequence
+            # via the nvfp4_emulation flag, matching native NVFP4 hardware behavior.
+            w13_inv_scale = layer.w13_input_scale_quant
+            if w13_inv_scale.numel() > 1:
+                w13_inv_scale = w13_inv_scale.min().reshape(1)
+            x_dq = ref_nvfp4_quant_dequant(x, w13_inv_scale)
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=dq_w13,
+                w2_weight=dq_w2,
+                nvfp4_emulation=True,
+                a2_scale=layer.w2_input_scale_quant,
+            )
+            emulation_dispatch = StandardDispatchOutput(
+                hidden_states=x_dq,
+                hidden_states_scale=None,
+                topk_output=dispatch_output.topk_output,
+            )
+            return self.runner.run(emulation_dispatch, quant_info)
 
         # FlashInfer TRTLLM FP4 path
         if self.enable_flashinfer_trtllm_moe and hasattr(layer, "g1_scale_c"):

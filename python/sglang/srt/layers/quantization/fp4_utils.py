@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.utils.common import (
     get_device_capability,
+    is_blackwell_supported,
     is_cuda,
     is_sm100_supported,
 )
@@ -95,6 +96,7 @@ class Fp4GemmRunnerBackend(Enum):
 
     AUTO = "auto"
     CUTLASS = "cutlass"
+    EMULATION = "emulation"
     FLASHINFER_CUDNN = "flashinfer_cudnn"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
@@ -106,6 +108,9 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_cutlass(self) -> bool:
         return self == Fp4GemmRunnerBackend.CUTLASS
+
+    def is_emulation(self) -> bool:
+        return self == Fp4GemmRunnerBackend.EMULATION
 
     def is_flashinfer_cudnn(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_CUDNN
@@ -156,10 +161,19 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
             backend = "flashinfer_cutedsl"
         elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
             backend = "marlin"
-        else:
+        elif is_cuda() and is_blackwell_supported():
             backend = "flashinfer_cutlass"
+        else:
+            backend = "emulation"
 
     FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend(backend)
+
+    # The emulation backend stores MoE weights as packed uint8. Shared experts
+    # in mixed-quantization checkpoints can be unquantized BF16 and cannot be
+    # fused into the same uint8 buffer. Disable fusion so shared experts run
+    # through their own unquantized path.
+    if FP4_GEMM_RUNNER_BACKEND.is_emulation():
+        server_args.disable_shared_experts_fusion = True
 
 
 def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:

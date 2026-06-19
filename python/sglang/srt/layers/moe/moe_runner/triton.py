@@ -67,6 +67,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    nvfp4_emulation: bool = False
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -165,6 +166,7 @@ def fused_experts_none_to_triton(
         a1_scale=quant_info.a13_scale,
         a2_scale=quant_info.a2_scale,
         block_shape=quant_info.block_shape,
+        nvfp4_emulation=quant_info.nvfp4_emulation,
     )
 
     return StandardCombineInput(

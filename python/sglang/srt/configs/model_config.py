@@ -1168,6 +1168,7 @@ class ModelConfig:
             "auto-round",
             "quark_int4fp8_moe",
             "quark_mxfp4",
+            "modelopt_fp4",  # supported via software emulation on ROCm
         ]
         optimized_quantization_methods = [
             "fp8",

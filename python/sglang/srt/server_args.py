@@ -269,6 +269,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "cutlass",
+    "emulation",
     "flashinfer_cudnn",
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
@@ -6046,8 +6047,9 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), "
+            "Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass on SM120, emulation otherwise), "
             "'cutlass' (SGLang CUTLASS kernel), "
+            "'emulation' (software dequant+matmul fallback; For research or testing purposes on GPUs lacking native NVFP4 support), "
             "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
             "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
