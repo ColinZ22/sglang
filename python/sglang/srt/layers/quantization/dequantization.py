@@ -6,7 +6,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import set_weight_attrs
 from sglang.srt.utils.common import is_cuda_alike
 
 NVFP4_BLOCK_SIZE = 16
