@@ -1353,6 +1353,7 @@ class ModelConfig:
             "quark_int4fp8_moe",
             "quark_mxfp4",
             "modelopt_fp4",  # supported via software emulation on ROCm
+            "modelopt_mixed",  # NVFP4 layers via software emulation, others native
         ]
         optimized_quantization_methods = [
             "fp8",
