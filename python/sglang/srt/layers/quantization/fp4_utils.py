@@ -173,7 +173,10 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
     # fused into the same uint8 buffer. Disable fusion so shared experts run
     # through their own unquantized path.
     if FP4_GEMM_RUNNER_BACKEND.is_emulation():
-        server_args.disable_shared_experts_fusion = True
+        server_args.override(
+            "fp4.emulation_disable_shared_experts_fusion",
+            disable_shared_experts_fusion=True,
+        )
 
 
 def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:
